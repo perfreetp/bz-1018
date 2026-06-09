@@ -151,7 +151,7 @@ export class RegistrationService {
     if (m < 0 || (m === 0 && today.getDate() < birthDate.getDate())) {
       age--;
     }
-    return age;
+    return Math.max(0, Math.min(150, age));
   }
 
   private generateRegistrationNo(raceId: string): string {
@@ -231,9 +231,16 @@ export class RegistrationService {
         throw new Error('该证件号在此赛事中已有报名记录');
       }
 
-      const registered = await category.incrementRegistered(data.gender);
+      const registered = await raceCategoryService.incrementRegistered(
+        data.categoryId,
+        data.gender,
+        session
+      );
       if (!registered) {
-        throw new Error('名额分配失败，请稍后重试');
+        if (category.isGenderFull(data.gender)) {
+          throw new Error('该性别组名额已满');
+        }
+        throw new Error('该组别名额已满');
       }
 
       const price = category.getCurrentPrice();
@@ -381,9 +388,99 @@ export class RegistrationService {
       throw new Error('当前报名状态不允许修改资料');
     }
 
+    const merged = {
+      realName: data.realName ?? registration.realName,
+      gender: data.gender ?? registration.gender,
+      birthDate: data.birthDate ?? registration.birthDate,
+      idDocument: data.idDocument ?? registration.idDocument,
+      phone: data.phone ?? registration.phone,
+      email: data.email ?? registration.email,
+      address: data.address ?? registration.address,
+      city: data.city ?? registration.city,
+      province: data.province ?? registration.province,
+      zipCode: data.zipCode ?? registration.zipCode,
+      occupation: data.occupation ?? registration.occupation,
+      company: data.company ?? registration.company,
+      emergencyContact: data.emergencyContact ?? registration.emergencyContact,
+      clothingSize: data.clothingSize ?? registration.clothingSize,
+      resultProof: data.resultProof ?? registration.resultProof,
+      medicalCertificate: data.medicalCertificate ?? registration.medicalCertificate,
+      photoUrl: data.photoUrl ?? registration.photoUrl,
+      note: data.note ?? registration.note,
+    };
+
+    const errors: string[] = [];
+
+    if (!/^1[3-9]\d{9}$/.test(merged.phone)) {
+      errors.push('手机号格式不正确');
+    }
+
+    if (merged.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(merged.email)) {
+      errors.push('邮箱格式不正确');
+    }
+
+    if (!/^1[3-9]\d{9}$/.test(merged.emergencyContact.phone)) {
+      errors.push('紧急联系人手机号格式不正确');
+    }
+
+    if (merged.idDocument?.type === IDType.ID_CARD && merged.idDocument?.number) {
+      const idResult = validateIdCard(merged.idDocument.number);
+      if (!idResult.valid) {
+        errors.push(idResult.message || '身份证号无效');
+      } else if (idResult.parsedData) {
+        const parsedDate = new Date(idResult.parsedData.birthDate);
+        const birthDate = new Date(merged.birthDate);
+        if (
+          parsedDate.getFullYear() !== birthDate.getFullYear() ||
+          parsedDate.getMonth() !== birthDate.getMonth() ||
+          parsedDate.getDate() !== birthDate.getDate()
+        ) {
+          errors.push('出生日期与身份证信息不匹配');
+        }
+        const idGender = idResult.parsedData.gender === 'male' ? Gender.MALE : Gender.FEMALE;
+        if (merged.gender !== idGender) {
+          errors.push('性别与身份证信息不匹配');
+        }
+      }
+    }
+
+    if (merged.idDocument?.type === IDType.PASSPORT && merged.idDocument?.number) {
+      if (!/^(G|D|S|P|H|M|E)\d{8}$/.test(merged.idDocument.number.trim().toUpperCase())) {
+        errors.push('护照号格式不正确');
+      }
+    }
+
+    const category = await RaceCategory.findById(registration.categoryId);
+    if (category && category.allowedSizes && category.allowedSizes.length > 0) {
+      if (!category.allowedSizes.includes(merged.clothingSize as ClothingSize)) {
+        errors.push(`衣服尺码 ${merged.clothingSize} 不在允许范围内: ${category.allowedSizes.join(', ')}`);
+      }
+    }
+
+    if (category && category.ageLimit) {
+      const age = this.calculateAge(new Date(merged.birthDate));
+      if (category.ageLimit.min !== undefined && age < category.ageLimit.min) {
+        errors.push(`年龄小于组别最低要求${category.ageLimit.min}岁`);
+      }
+      if (category.ageLimit.max !== undefined && age > category.ageLimit.max) {
+        errors.push(`年龄超过组别最高限制${category.ageLimit.max}岁`);
+      }
+    }
+
+    if (errors.length > 0) {
+      throw new Error(errors.join('；'));
+    }
+
+    const recalculatedAge = this.calculateAge(new Date(merged.birthDate));
+
     return Registration.findByIdAndUpdate(
       id,
-      { $set: data },
+      {
+        $set: {
+          ...merged,
+          age: recalculatedAge,
+        },
+      },
       { new: true, runValidators: true }
     );
   }
@@ -416,7 +513,8 @@ export class RegistrationService {
 
       await raceCategoryService.decrementRegistered(
         registration.categoryId.toString(),
-        registration.gender
+        registration.gender,
+        session
       );
 
       await session.commitTransaction();
@@ -476,9 +574,16 @@ export class RegistrationService {
     if (!race) throw new Error('赛事不存在');
     if (!category) throw new Error('组别不存在');
     if (!race.isTeamRegistrationAllowed) throw new Error('该赛事不接受团队报名');
+    if (category.raceId?.toString() !== data.raceId) throw new Error('组别不属于该赛事');
     if (!captainReg) throw new Error('队长报名记录不存在');
     if (!captainReg.userId || captainReg.userId?.toString() !== data.userId) {
       throw new Error('只能用自己的报名记录创建团队');
+    }
+    if (captainReg.raceId?.toString() !== data.raceId) {
+      throw new Error('队长报名赛事与团队赛事不一致');
+    }
+    if (captainReg.categoryId?.toString() !== data.categoryId) {
+      throw new Error('队长报名组别与团队组别不一致');
     }
 
     const existingTeam = await Team.findOne({
@@ -549,6 +654,9 @@ export class RegistrationService {
     }
     if (registration.raceId?.toString() !== team.raceId.toString()) {
       throw new Error('报名赛事与团队赛事不一致');
+    }
+    if (registration.categoryId?.toString() !== team.categoryId.toString()) {
+      throw new Error('报名组别与团队组别不一致');
     }
     if (registration.teamId) {
       throw new Error('该报名已加入其他团队');

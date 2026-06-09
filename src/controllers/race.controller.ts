@@ -87,11 +87,12 @@ export const raceController = {
     validateRequest,
     async (req: Request, res: Response, next: NextFunction) => {
       try {
+        const isPublishedParam = req.query.isPublished;
         const result = await raceService.getRaces({
           page: parseInt(req.query.page as string) || 1,
           pageSize: parseInt(req.query.pageSize as string) || 20,
           status: req.query.status as RaceStatus,
-          isPublished: req.query.isPublished === 'true',
+          isPublished: isPublishedParam !== undefined ? (isPublishedParam === 'true') : undefined,
           keyword: req.query.keyword as string,
           sortBy: req.query.sortBy as string,
           sortOrder: req.query.sortOrder as 'asc' | 'desc',

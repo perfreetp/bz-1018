@@ -1,3 +1,4 @@
+import mongoose from 'mongoose';
 import { RaceCategory, IRaceCategory } from '../models/raceCategory.model';
 import { Race } from '../models/race.model';
 import { Registration } from '../models/registration.model';
@@ -219,25 +220,88 @@ export class RaceCategoryService {
     };
   }
 
-  async incrementRegistered(categoryId: string, gender?: Gender): Promise<boolean> {
-    const category = await RaceCategory.findById(categoryId);
+  async incrementRegistered(categoryId: string, gender?: Gender, session?: mongoose.ClientSession): Promise<boolean> {
+    const category = await RaceCategory.findById(categoryId).session(session || undefined);
     if (!category) {
       throw new Error('组别不存在');
     }
 
-    const success = await category.incrementRegistered(gender);
+    const updateFilter: Record<string, any> = {
+      _id: new mongoose.Types.ObjectId(categoryId),
+      isActive: true,
+    };
+
+    const updateOperation: Record<string, any> = {
+      $inc: { registered: 1 },
+    };
+
+    updateFilter.$expr = { $lt: ['$registered', '$capacity'] };
+
+    if (gender === Gender.MALE && category.maleCapacity !== undefined) {
+      updateFilter.$and = updateFilter.$and || [];
+      updateFilter.$and.push({
+        $expr: { $lt: [{ $ifNull: ['$maleRegistered', 0] }, '$maleCapacity'] },
+      });
+      updateOperation.$inc.maleRegistered = 1;
+    }
+
+    if (gender === Gender.FEMALE && category.femaleCapacity !== undefined) {
+      updateFilter.$and = updateFilter.$and || [];
+      updateFilter.$and.push({
+        $expr: { $lt: [{ $ifNull: ['$femaleRegistered', 0] }, '$femaleCapacity'] },
+      });
+      updateOperation.$inc.femaleRegistered = 1;
+    }
+
+    const options: Record<string, any> = { new: true };
+    if (session) {
+      options.session = session;
+    }
+
+    const result = await RaceCategory.findOneAndUpdate(
+      updateFilter,
+      updateOperation,
+      options
+    );
+
+    const success = !!result;
     if (success) {
       await raceService.updateTotalCapacity(category.raceId.toString());
     }
     return success;
   }
 
-  async decrementRegistered(categoryId: string, gender?: Gender): Promise<void> {
-    const category = await RaceCategory.findById(categoryId);
+  async decrementRegistered(categoryId: string, gender?: Gender, session?: mongoose.ClientSession): Promise<void> {
+    const updateOperation: Record<string, any> = {
+      $inc: { registered: -1 },
+    };
+    if (gender === Gender.MALE) {
+      updateOperation.$inc.maleRegistered = -1;
+    }
+    if (gender === Gender.FEMALE) {
+      updateOperation.$inc.femaleRegistered = -1;
+    }
+
+    const category = await RaceCategory.findById(categoryId).session(session || undefined);
     if (!category) {
       return;
     }
-    await category.decrementRegistered(gender);
+
+    const filter: Record<string, any> = { _id: new mongoose.Types.ObjectId(categoryId) };
+    filter.registered = { $gt: 0 };
+    if (gender === Gender.MALE) {
+      filter.maleRegistered = { $gt: 0 };
+    }
+    if (gender === Gender.FEMALE) {
+      filter.femaleRegistered = { $gt: 0 };
+    }
+
+    const options: Record<string, any> = {};
+    if (session) {
+      options.session = session;
+    }
+
+    await RaceCategory.findOneAndUpdate(filter, updateOperation, options);
     await raceService.updateTotalCapacity(category.raceId.toString());
   }
 
